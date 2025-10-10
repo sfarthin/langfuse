@@ -421,9 +421,26 @@ const parseGeneration = (
   if (!isGenerationLike(generation.type)) return null;
 
   const isLangGraph = isLangGraphTrace(generation);
-  const modelParams = parseModelParams(generation, modelToProviderMap);
+  const baseModelParams = parseModelParams(generation, modelToProviderMap);
   const tools = parseTools(generation, isLangGraph);
   const structuredOutputSchema = parseStructuredOutputSchema(generation);
+  const providerOptions = parseProviderOptionsFromGeneration(generation);
+
+  const modelParams = baseModelParams
+    ? providerOptions
+      ? {
+          ...baseModelParams,
+          providerOptions: {
+            value: {
+              ...(baseModelParams.providerOptions?.value ??
+                ({} as UIModelParams["providerOptions"]["value"])),
+              ...providerOptions,
+            } as UIModelParams["providerOptions"]["value"],
+            enabled: true,
+          },
+        }
+      : baseModelParams
+    : undefined;
 
   let input = generation.input?.valueOf();
 
@@ -672,4 +689,63 @@ function parseStructuredOutputSchema(
     }
   } catch {}
   return null;
+}
+
+/**
+ * LiteLLM stores any bespoke provider configuration that callers pass to the
+ * `/chat/completions` proxy under a `requester_metadata` key on the generation
+ * metadata. Steve Farthing requested that we forward those exact options when a
+ * user jumps from a generation into the playground so custom adapters receive
+ * the same configuration. The rest of the LiteLLM metadata contains
+ * instrumentation data (API key budgets, cache state, etc.) that should not be
+ * forwarded to the playground. Restricting the copy to `requester_metadata`
+ * keeps the surface area intentionally small and avoids leaking unrelated
+ * internal fields into provider options.
+ *
+ * References:
+ * - https://docs.litellm.ai/docs/observability#requester-metadata
+ * - Slack discussion with Steve Farthing in Langfuse org (2025-02-24)
+ */
+function parseProviderOptionsFromGeneration(
+  generation: Omit<Observation, "input" | "output" | "metadata"> & {
+    input: string | null;
+    output: string | null;
+    metadata: string | null;
+  },
+): UIModelParams["providerOptions"]["value"] | undefined {
+  let metadata: unknown = generation.metadata;
+
+  if (metadata === null || metadata === undefined) {
+    return undefined;
+  }
+
+  if (typeof metadata === "string") {
+    const trimmedMetadata = metadata.trim();
+
+    if (!trimmedMetadata) {
+      return undefined;
+    }
+
+    try {
+      metadata = JSON.parse(trimmedMetadata);
+    } catch {
+      return undefined;
+    }
+  }
+
+  if (typeof metadata !== "object" || metadata === null) {
+    return undefined;
+  }
+
+  const requesterMetadata = (metadata as Record<string, unknown>)[
+    "requester_metadata"
+  ];
+
+  if (typeof requesterMetadata !== "object" || requesterMetadata === null) {
+    return undefined;
+  }
+
+  return {
+    metadata: requesterMetadata,
+  } as UIModelParams["providerOptions"]["value"];
 }
