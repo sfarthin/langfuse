@@ -164,6 +164,10 @@ describe("PromptService", () => {
       expect(mockRedis.smembers).toHaveBeenCalledWith(
         "prompt_key_index:project1",
       );
+
+      expect(mockRedis.smembers).toHaveBeenCalledWith(
+        "prompt_meta_index:project1",
+      );
     });
   });
 

@@ -3,8 +3,15 @@ import {
   type FilterState,
   promptsTableCols,
 } from "@langfuse/shared";
+import { createHash } from "node:crypto";
+
 import { prisma } from "@langfuse/shared/src/db";
-import { tableColumnsToSqlFilterAndPrefix } from "@langfuse/shared/src/server";
+import {
+  logger,
+  redis,
+  tableColumnsToSqlFilterAndPrefix,
+} from "@langfuse/shared/src/server";
+import { env } from "@langfuse/shared/src/env";
 
 export type GetPromptsMetaParams = GetPromptsMetaType & { projectId: string };
 
@@ -12,6 +19,15 @@ export const getPromptsMeta = async (
   params: GetPromptsMetaParams,
 ): Promise<PromptsMetaResponse> => {
   const { projectId, page, limit } = params;
+  const cacheResult = await getCachedPromptsMeta(params);
+
+  if (cacheResult.hit && cacheResult.value) {
+    logger.debug(
+      `[PromptMetaCache] Returning cached prompt metadata for project ${projectId} using key ${cacheResult.cacheKey}`,
+    );
+
+    return cacheResult.value;
+  }
 
   const promptsMeta = (await prisma.$queryRaw`
     WITH latest_version_config AS (
@@ -75,7 +91,7 @@ export const getPromptsMeta = async (
   const totalItems = Number(totalItemsCount);
   const totalPages = Math.ceil(totalItems / limit);
 
-  return {
+  const response: PromptsMetaResponse = {
     data: promptsMeta,
     meta: { page, limit, totalPages, totalItems },
 
@@ -83,6 +99,9 @@ export const getPromptsMeta = async (
     // https://github.com/langfuse/langfuse/issues/2068
     pagination: { page, limit, totalPages, totalItems },
   };
+  await cachePromptsMeta(params, response, cacheResult.cacheKey);
+
+  return response;
 };
 
 type PromptsMeta = {
@@ -171,4 +190,89 @@ const getPromptsFilterCondition = (params: GetPromptsMetaType) => {
   }
 
   return tableColumnsToSqlFilterAndPrefix(filters, promptsTableCols, "prompts");
+};
+
+const PROMPT_META_CACHE_PREFIX = "prompt_meta";
+const PROMPT_META_INDEX_PREFIX = "prompt_meta_index";
+
+type CachedPromptsMeta = {
+  hit: boolean;
+  value?: PromptsMetaResponse;
+  cacheKey?: string;
+};
+
+const shouldUseCache = () =>
+  Boolean(redis) && env.LANGFUSE_CACHE_PROMPT_ENABLED === "true";
+
+const getCacheTtl = () => env.LANGFUSE_CACHE_PROMPT_TTL_SECONDS;
+
+const buildMetadataCacheKey = (params: GetPromptsMetaParams) => {
+  const { projectId, ...rest } = params;
+  const normalizedEntries = Object.entries(rest)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => [key, normalizeValue(value)])
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  const hash = createHash("sha256")
+    .update(JSON.stringify(normalizedEntries))
+    .digest("hex");
+
+  return `${PROMPT_META_CACHE_PREFIX}:${projectId}:${hash}`;
+};
+
+const getMetadataIndexKey = (projectId: string) =>
+  `${PROMPT_META_INDEX_PREFIX}:${projectId}`;
+
+const normalizeValue = (value: unknown): string => {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value))
+    return `[${value.map((item) => normalizeValue(item)).join(",")}]`;
+  return String(value);
+};
+
+const getCachedPromptsMeta = async (
+  params: GetPromptsMetaParams,
+): Promise<CachedPromptsMeta> => {
+  if (!shouldUseCache()) {
+    return { hit: false };
+  }
+
+  const cacheKey = buildMetadataCacheKey(params);
+
+  try {
+    const cached = await redis?.getex(cacheKey, "EX", getCacheTtl());
+
+    if (!cached) {
+      return { hit: false, cacheKey };
+    }
+
+    return {
+      hit: true,
+      value: JSON.parse(cached) as PromptsMetaResponse,
+      cacheKey,
+    };
+  } catch (error) {
+    logger.error("Failed to read prompt metadata cache", error);
+
+    return { hit: false, cacheKey };
+  }
+};
+
+const cachePromptsMeta = async (
+  params: GetPromptsMetaParams,
+  response: PromptsMetaResponse,
+  existingCacheKey?: string,
+) => {
+  if (!shouldUseCache()) return;
+
+  const cacheKey = existingCacheKey ?? buildMetadataCacheKey(params);
+  const serialized = JSON.stringify(response);
+
+  try {
+    const indexKey = getMetadataIndexKey(params.projectId);
+    await redis?.sadd(indexKey, cacheKey);
+    await redis?.set(cacheKey, serialized, "EX", getCacheTtl());
+  } catch (error) {
+    logger.error("Failed to cache prompt metadata", error);
+  }
 };

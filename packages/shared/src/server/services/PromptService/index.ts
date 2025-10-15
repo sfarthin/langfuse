@@ -20,6 +20,7 @@ export const MAX_PROMPT_NESTING_DEPTH = 5;
 export class PromptService {
   private cacheEnabled: boolean;
   private ttlSeconds: number;
+  private static readonly metadataKeyIndexPrefix = "prompt_meta_index";
 
   constructor(
     // eslint-disable-next-line no-unused-vars
@@ -241,12 +242,17 @@ export class PromptService {
     const legacyKeyIndexKey = `${keyIndexKey}:${params.promptName}`;
     const legacyKeys = await this.redis?.smembers(legacyKeyIndexKey);
 
+    const metadataKeyIndexKey = this.getMetadataKeyIndex(params.projectId);
+    const metadataKeys = await this.redis?.smembers(metadataKeyIndexKey);
+
     // Delete all keys for the prefix and the key index using safe multi-delete
     const keysToDelete = [
       ...(keys ?? []),
       keyIndexKey,
       ...(legacyKeys ?? []),
       legacyKeyIndexKey,
+      ...(metadataKeys ?? []),
+      metadataKeyIndexKey,
     ];
     await safeMultiDel(this.redis, keysToDelete);
   }
@@ -267,6 +273,10 @@ export class PromptService {
     params: Pick<PromptParams, "projectId" | "promptName">,
   ): string {
     return `prompt_key_index:${params.projectId}`;
+  }
+
+  private getMetadataKeyIndex(projectId: string): string {
+    return `${PromptService.metadataKeyIndexPrefix}:${projectId}`;
   }
 
   public async buildAndResolvePromptGraph(params: {
